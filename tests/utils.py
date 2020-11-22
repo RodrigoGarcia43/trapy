@@ -3,7 +3,7 @@ import time
 
 
 def file_hash(f):
-    with open(f, 'rb') as fp:
+    with open(f, "rb") as fp:
         data = fp.read()
         return hashlib.sha1(data).hexdigest()
 
@@ -24,7 +24,7 @@ def wait_for(func, delta=0.1, timeout=3):
     while True:
         tc = time.time()
         if tc > t + timeout:
-            raise Exception('timeout exception')
+            raise Exception("timeout exception")
 
         if func():
             break
@@ -33,8 +33,8 @@ def wait_for(func, delta=0.1, timeout=3):
 
 
 def is_port_open(address, host_ctrl):
-    host, port = address.split(':')
+    host, port = address.split(":")
 
-    host_ctrl.cmd('nc -z -v {} {}'.format(host, port))
+    host_ctrl.cmd("nc -z -v {} {}".format(host, port))
 
-    return int(host_ctrl.cmd('echo $?')) == 0
+    return int(host_ctrl.cmd("echo $?")) == 0

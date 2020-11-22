@@ -1,15 +1,16 @@
-from trapy import listen, accept, dial, recv, send, close
+from trapy import listen, accept, close, recv, send
 
 host = "10.0.0.2"
 port = 6
 
 print("-------------------SERVER-------------------")
 server = listen(host + f":{port}")
+_server = accept(server)
 while True:
-    _server = accept(server)
-    # while _server != None:
-    #     r = recv(_server, 40)
-    #     print("data recived: " + str(r))
-    #     send(_server, r)
-    #     print("data sent: " + str(r))
+    r = recv(_server, 47)
+    print("data recived: " + str(r))
+    r = r.upper()
+    print(send(_server, r))
+
 close(server)
+close(_server)

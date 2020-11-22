@@ -1,12 +1,21 @@
-import sys, socket, time, random
-from struct import pack, unpack
-import logging
+from Mapper import Mapper
+import random, socket, sys, time
+from threading import Thread
+from ports import get_port, bind, close_port
 
-from utils import parse_address
+from threads import RecvTask
+
+from utils import (
+    parse_address,
+    build_tcp_header,
+    get_packet,
+    _get_packet,
+    clean_in_buffer,
+)
 
 
 class Conn:
-    def __init__(self, sock=None):
+    def __init__(self, sock=None, size=1024):
         if sock is None:
             self.socket = socket.socket(
                 socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP
@@ -14,10 +23,30 @@ class Conn:
         else:
             self.socket = sock
 
-        self.server_host = None
-        self.server_port = None
-        self.client_host = None
-        self.client_port = None
+        self.fragment_size = size
+        self.seq_limit = 2 ** 32
+        self.seq = random.randint(0, self.seq_limit)
+        # self.seq = 2 ** 32 - 1000
+
+        self.ack = None
+
+        self.source_address = None
+        self.dest_address = None
+        self.time_limit = 0.25
+        self.time_errors_count = 1
+        self.recived_buffer = b""
+
+    def get_time_limit(self):
+        result = self.time_limit
+        self.time_limit = self.time_limit * 2
+        self.time_errors_count += 1
+        if self.time_errors_count == 10:
+            return None
+        return result
+
+    def reset_time_limit(self):
+        self.time_limit = 0.25
+        self.time_errors_count = 1
 
 
 class ConnException(Exception):
@@ -27,263 +56,332 @@ class ConnException(Exception):
 def listen(address: str) -> Conn:
     conn = Conn()
 
-    host, port = parse_address(address)
-
     print("socket binded to: " + address)
-    conn.server_host, conn.server_port = host, port
-    conn.socket.bind((host, port))
+    conn.source_address = parse_address(address)
+    bind(conn.source_address[1])
 
     return conn
 
 
-def accept(conn) -> Conn:
-    data, address = conn.socket.recvfrom(1024)
-    ip_header, tcp_header, _ = get_packet(data)
+def accept(conn, size=1024) -> Conn:
+    while True:
+        try:
+            data, address = conn.socket.recvfrom(1024)
+            ip_header, tcp_header, _ = _get_packet(data, conn)
+        except (TypeError):
+            continue
 
-    if not verify_checksum(ip_header, tcp_header):
-        print("field checksum to accept conection from: " + str(address))
+        if (tcp_header[5] >> 1 & 0x01) != 1:
+            print(
+                "field to accept conection from: "
+                + str((address[0], tcp_header[0]))
+                + " syn flag has value 0"
+            )
+            continue
 
-    if tcp_header[5] >> 1 != 1:
-        print(
-            "field to accept conection from: " + str(address) + " syn flag has value 0"
+        new_conn = Conn(size=size)
+        new_conn.source_address = (
+            conn.source_address[0],
+            get_port(),
+        )
+        new_conn.dest_address = (address[0], tcp_header[0])
+
+        print("accepted connection from: " + str((address[0], tcp_header[0])))
+
+        resp_tcp_header = build_tcp_header(
+            new_conn.source_address[1],
+            new_conn.dest_address[1],
+            new_conn.seq,
+            tcp_header[2] + 1,
+            syn=1,
         )
 
-    new_conn = Conn()
-    new_conn.server_host, new_conn.server_port = conn.server_host, conn.server_port + 1
-    new_conn.client_host = address[0]
-    new_conn.client_port = address[1]
-    new_conn.socket.bind((new_conn.server_host, new_conn.server_port))
+        packet = resp_tcp_header
+        new_conn.socket.sendto(packet, new_conn.dest_address)
 
-    print("accepted connection from: " + str(address))
+        new_conn.ack = tcp_header[2]
 
-    return conn
+        reset = False
+        time_limit = new_conn.get_time_limit()
+        timer = time.time()
+        conn.socket.settimeout(1)
+        while True:
+            if time_limit is None:
+                reset = True
+                break
+
+            if time.time() - timer > time_limit:
+                print("re-sending second SYN-ACK")
+                timer = time.time()
+                new_conn.socket.sendto(packet, new_conn.dest_address)
+                time_limit = conn.get_time_limit()
+
+            try:
+                data, address = new_conn.socket.recvfrom(1024)
+
+            except socket.timeout:
+                continue
+
+            try:
+                _, _, _ = get_packet(data, new_conn)
+                conn.reset_time_limit()
+                break
+            except TypeError:
+                continue
+
+        if reset:
+            print("Reset accept")
+            close(new_conn)
+            continue
+
+        print("Succesfull handshake")
+        print((new_conn.seq, new_conn.ack))
+
+        return new_conn
 
 
-def dial(server_address, client_address) -> Conn:
-    conn = Conn()
+def dial(address, size=1024) -> Conn:
+    conn = Conn(size=size)
 
-    conn.server_host, conn.server_port = parse_address(server_address)
-    conn.client_host, conn.client_port = parse_address(client_address)
+    conn.dest_address = parse_address(address)
+    source_port = get_port()
+    tcp_header = build_tcp_header(source_port, conn.dest_address[1], conn.seq, 7, syn=1)
+    packet = tcp_header
 
-    ip_header = build_ip_header(conn.server_host, conn.client_host)
-    tcp_header = build_tcp_header(
-        conn.server_host, conn.client_host, conn.server_port, conn.client_port, syn=1
-    )
-    packet = ip_header + tcp_header
+    print("dial to: " + str(address))
 
-    ip_header = unpack("!BBHHHBBH4s4s", packet[0:20])
+    conn.source_address = (conn.socket.getsockname()[0], source_port)
+    conn.socket.sendto(packet, conn.dest_address)
 
-    tcp_header = unpack("!HHLLBBHHH", packet[20:40])
+    close_dial = False
+    time_limit = conn.get_time_limit()
+    timer = time.time()
+    conn.socket.settimeout(1)
+    while True:
+        if time_limit is None:
+            close_dial = True
+            break
 
-    print("dial to: " + server_address)
-    conn.socket.sendto(packet, (conn.server_host, conn.server_port))
-    conn.socket.bind()
+        if time.time() - timer > time_limit:
+            print("re-sending SYN")
+            conn.socket.sendto(packet, conn.dest_address)
+            time_limit = conn.get_time_limit()
+            timer = time.time()
+            continue
+
+        try:
+            try:
+                data, address = conn.socket.recvfrom(1024)
+            except socket.timeout:
+                continue
+
+            ip_header, tcp_header, _ = _get_packet(data, conn)
+            conn.reset_time_limit()
+            break
+        except TypeError:
+            continue
+
+    socket.setdefaulttimeout(None)
+    if close_dial:
+        raise ConnException("Dial Failed")
+
+    conn.ack = tcp_header[2]
+
+    conn.dest_address = (socket.inet_ntoa(ip_header[8]), tcp_header[0])
+
+    print("Succesful handshake")
+    print((conn.seq, conn.ack))
+
+    new_tcp_header = build_tcp_header(0, conn.dest_address[1], conn.seq, conn.ack + 1)
+    conn.socket.sendto(new_tcp_header, conn.dest_address)
 
     return conn
 
 
 def send(conn: Conn, data: bytes) -> int:
-    ip_header = b"\x45\x00\x00\x28"  # Version, IHL, Type of Service | Total Length
-    ip_header += b"\xab\xcd\x00\x00"  # Identification | Flags, Fragment Offset
-    ip_header += b"\x40\x06\xa6\xec"  # TTL, Protocol | Header Checksum
-    ip_header += b"\x0a\x00\x00\x01"  # Source Address
-    ip_header += b"\x0a\x00\x00\x02"  # Destination Address
+    size = conn.fragment_size
+    # TODO
+    # window_size = min(max(1, int(len(data) / 10)), int(conn.seq_limit / 10)))
+    window_size = 1024 * 20
 
-    tcp_header = b"\x30\x39\x00\x50"  # Source Port | Destination Port
-    tcp_header += b"\x00\x00\x00\x00"  # Sequence Number
-    tcp_header += b"\x00\x00\x00\x00"  # Acknowledgement Number
-    tcp_header += b"\x50\x02\x71\x10"  # Data Offset, Reserved, Flags | Window Size
-    tcp_header += b"\xe6\x32\x00\x00"  # Checksum | Urgent Pointer
+    window = conn.seq
+    duplicated_ack = 0
+    mapper = Mapper(conn.seq, conn.seq_limit, len(data), window_size, size)
+    recv_task = RecvTask()
+    t = Thread(target=recv_task._recv, args=[conn])
+    t.start()
 
-    packet = ip_header + tcp_header
-    conn.socket.sendto(packet, (conn.host, conn.port))
+    timer = None
+    time_limit = conn.get_time_limit()
+
+    while True:
+        if time_limit is None:
+            recv_task.stop()
+            t.join()
+            raise ConnException("Timeout")
+
+        if len(recv_task.recived) > 0:
+            conn.reset_time_limit()
+
+            _, tcp_header, _ = recv_task.recived.pop(0)
+
+            if (tcp_header[5] >> 4 & 0x01) != 1:
+                continue
+
+            ack = tcp_header[3] % conn.seq_limit
+            print(ack)
+
+            if mapper.get(ack) > mapper.get(window):
+                if conn.seq != window:
+                    timer = time.time()
+                else:
+                    timer = None
+
+                window = ack % conn.seq_limit
+                duplicated_ack = 0
+
+                # print("ack -> " + str(ack))
+                if mapper.get(ack) >= len(data):
+                    recv_task.stop()
+                    t.join()
+                    return len(data)
+            else:
+                duplicated_ack += 1
+                if duplicated_ack == 3:
+                    recv_task.recived.clear()
+                    conn.seq = ack % conn.seq_limit
+                    duplicated_ack = 0
+
+        if timer is not None and time.time() - timer > conn.time_limit:
+            # print((conn.seq, window))
+            conn.seq = window % conn.seq_limit
+            time_limit = conn.get_time_limit()
+            timer = time.time()
+
+        if (mapper.get(conn.seq) < (mapper.get(window) + window_size)) and (
+            mapper.get(conn.seq) < len(data)
+        ):
+
+            # if (
+            #     (conn.seq - window <= window_size and conn.seq - window >= 0)
+            #     or (
+            #         ((conn.seq_limit - 1) - window + conn.seq) <= window_size
+            #         and conn.seq - window < 0
+            #     )
+            # ) and (mapper.get(conn.seq) < len(data)):
+
+            if timer is None:
+                timer = time.time()
+
+            if mapper.get(conn.seq) + size >= len(data):
+                to_send = data[mapper.get(conn.seq) :]
+                tcp_header = build_tcp_header(
+                    conn.source_address[1],
+                    conn.dest_address[1],
+                    conn.seq,
+                    3,
+                    fin=1,
+                    data=to_send,
+                )
+                packet = tcp_header + to_send
+            else:
+                to_send = data[mapper.get(conn.seq) : mapper.get(conn.seq) + size]
+                tcp_header = build_tcp_header(
+                    conn.source_address[1],
+                    conn.dest_address[1],
+                    conn.seq,
+                    4,
+                    data=to_send,
+                )
+
+                packet = tcp_header + to_send
+            print("sending seq -> " + str(conn.seq))
+            conn.socket.sendto(packet, conn.dest_address)
+            conn.seq = (conn.seq + len(to_send)) % conn.seq_limit
 
 
 def recv(conn: Conn, length: int) -> bytes:
-    conn.socket.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-    return conn.socket.recvfrom(65565)
+    # recived_buffer = b""
+    recv_task = RecvTask()
+    t = Thread(target=recv_task._recv, args=[conn])
+    t.start()
+    timer = None
+    time_limit = conn.get_time_limit()
+    retr = 0
+    while True:
+        if time_limit is None:
+            recv_task.is_runing = False
+            t.join()
+            clean_in_buffer(conn)
+            raise ConnException("Timeout")
+
+        if len(recv_task.recived) > 0:
+            timer = time.time()
+            conn.reset_time_limit()
+            _, tcp_header, data = recv_task.recived.pop(0)
+
+            if (tcp_header[5] >> 4 & 0x01) == 1:
+                continue
+
+            seq_recived = tcp_header[2]
+
+            if len(data) == 0:
+                continue
+
+            if seq_recived == conn.ack:
+                retr = 0
+                conn.ack = (seq_recived + len(data)) % conn.seq_limit
+                # print((seq_recived, conn.ack))
+
+                conn.recived_buffer += data
+                new_tcp_header = build_tcp_header(
+                    conn.source_address[1], conn.dest_address[1], 7, conn.ack, _ack=1
+                )
+                # print(conn.ack)
+                packet = new_tcp_header
+                conn.socket.sendto(packet, conn.dest_address)
+                if (tcp_header[5] & 0x01) == 1:
+                    for _ in range(10):
+                        conn.socket.sendto(packet, conn.dest_address)
+                    recv_task.is_runing = False
+                    t.join()
+                    clean_in_buffer(conn)
+                    print("AAAAAAAA")
+                    if len(conn.recived_buffer) < length:
+                        result = conn.recived_buffer[:]
+                        conn.recived_buffer = b""
+                        return result
+                    else:
+                        result = conn.recived_buffer[0:length]
+                        conn.recived_buffer = conn.recived_buffer[length:]
+                        return result
+
+            else:
+                # print((seq_recived, conn.ack))
+                retr += 1
+                if retr == 3:
+                    retr = 0
+                    recv_task.recived.clear()
+                new_tcp_header = build_tcp_header(
+                    conn.source_address[1], conn.dest_address[1], 7, conn.ack, _ack=1
+                )
+                # print(conn.ack)
+                packet = new_tcp_header
+                conn.socket.sendto(packet, conn.dest_address)
+
+        if timer is not None and time.time() - timer > time_limit:
+            timer = time.time()
+            time_limit = conn.get_time_limit()
+            print("re-sending ack " + str(conn.ack))
+            new_tcp_header = build_tcp_header(
+                conn.source_address[1], conn.dest_address[1], 7, conn.ack, _ack=1
+            )
+            print(conn.ack)
+            packet = new_tcp_header
+            conn.socket.sendto(packet, conn.dest_address)
 
 
 def close(conn: Conn):
     conn.socket.close()
     conn.socket = None
-
-
-def build_ip_header(source_ip, dest_ip, data_len=0):
-    ip_ihl = 5
-    ip_ver = 4
-    ip_tos = 0
-    ip_tot_len = 40 + data_len
-    ip_id = random.randint(10000, 50000)
-    ip_frag_off = 0
-    ip_ttl = 255
-    ip_proto = socket.IPPROTO_TCP
-    ip_check = 0
-    ip_saddr = socket.inet_aton(source_ip)
-    ip_daddr = socket.inet_aton(dest_ip)
-
-    ip_ihl_ver = (ip_ver << 4) + ip_ihl
-
-    ip_header = pack(
-        "!BBHHHBBH4s4s",
-        ip_ihl_ver,
-        ip_tos,
-        ip_tot_len,
-        ip_id,
-        ip_frag_off,
-        ip_ttl,
-        ip_proto,
-        ip_check,
-        ip_saddr,
-        ip_daddr,
-    )
-    ip_check = get_checksum(ip_header)
-    ip_header = pack(
-        "!BBHHHBBH4s4s",
-        ip_ihl_ver,
-        ip_tos,
-        ip_tot_len,
-        ip_id,
-        ip_frag_off,
-        ip_ttl,
-        ip_proto,
-        ip_check,
-        ip_saddr,
-        ip_daddr,
-    )
-
-    return ip_header
-
-
-def build_tcp_header(source_ip, dest_ip, source_port, dest_port, data=None, syn=0):
-
-    tcp_source = source_port
-    tcp_dest = dest_port
-    tcp_seq = 454
-    tcp_ack_seq = 0
-    tcp_doff = 5  # 4 bit field, size of tcp header, 5 * 4 = 20 bytes
-    tcp_fin = 0
-    tcp_syn = syn
-    tcp_rst = 0
-    tcp_psh = 0
-    tcp_ack = 0
-    tcp_urg = 0
-    tcp_window = socket.htons(5840)  # 	maximum allowed window size
-    tcp_check = 0
-    tcp_urg_ptr = 0
-
-    tcp_offset_res = (tcp_doff << 4) + 0
-    tcp_flags = (
-        tcp_fin
-        + (tcp_syn << 1)
-        + (tcp_rst << 2)
-        + (tcp_psh << 3)
-        + (tcp_ack << 4)
-        + (tcp_urg << 5)
-    )
-
-    # the ! in the pack format string means network order
-    tcp_header = pack(
-        "!HHLLBBHHH",
-        tcp_source,
-        tcp_dest,
-        tcp_seq,
-        tcp_ack_seq,
-        tcp_offset_res,
-        tcp_flags,
-        tcp_window,
-        tcp_check,
-        tcp_urg_ptr,
-    )
-
-    # pseudo header fields
-    source_address = socket.inet_aton(source_ip)
-    dest_address = socket.inet_aton(dest_ip)
-    placeholder = 0
-    protocol = socket.IPPROTO_TCP
-
-    if data is not None:
-        tcp_length = 20 + len(str(data))
-    else:
-        tcp_length = 20
-
-    pseudo_header = pack(
-        "!4s4sBBH", source_address, dest_address, placeholder, protocol, tcp_length
-    )
-
-    pseudo_header = pseudo_header + tcp_header
-    if data is not None:
-        pseudo_header = pseudo_header + bytes(data)
-
-    tcp_check = get_checksum(pseudo_header)
-
-    # make the tcp header again and fill the correct checksum - remember checksum is NOT in network byte order
-    tcp_header = pack(
-        "!HHLLBBHHH",
-        tcp_source,
-        tcp_dest,
-        tcp_seq,
-        tcp_ack_seq,
-        tcp_offset_res,
-        tcp_flags,
-        tcp_window,
-        tcp_check,
-        tcp_urg_ptr,
-    )
-    return tcp_header
-
-
-def get_checksum(data):
-    sum = 0
-    for index in range(0, len(data), 2):
-        word = (data[index] << 8) + (data[index + 1])
-        sum = sum + word
-    sum = (sum >> 16) + (sum & 0xFFFF)
-    sum = ~sum & 0xFFFF
-    return sum
-
-
-def get_packet(data):
-    ip_header = data[20:40]
-    ip_header = unpack("!BBHHHBBH4s4s", ip_header)
-
-    tcp_header = data[40:60]
-    tcp_header = unpack("!HHLLBBHHH", tcp_header)
-
-    data = data[40:]
-    return ip_header, tcp_header, data
-
-
-def verify_checksum(ip_header, tcp_header, data=None):
-    placeholder = 0
-    if data is not None:
-        tcp_length = 20 + len(data)
-    else:
-        tcp_length = 20
-    protocol = ip_header[6]
-    sourceIP = ip_header[8]
-    destIP = ip_header[9]
-
-    received_tcp_segment = pack(
-        "!HHLLBBHHH",
-        tcp_header[0],
-        tcp_header[1],
-        tcp_header[2],
-        tcp_header[3],
-        tcp_header[4],
-        tcp_header[5],
-        tcp_header[6],
-        0,
-        tcp_header[8],
-    )
-    pseudo_hdr = pack("!4s4sBBH", sourceIP, destIP, placeholder, protocol, tcp_length)
-    total_msg = pseudo_hdr + received_tcp_segment
-    if data is not None:
-        total_msg += data
-
-    checksum_from_packet = tcp_header[7]
-    tcp_checksum = get_checksum(total_msg)
-    print(checksum_from_packet)
-    print(tcp_checksum)
-    return checksum_from_packet == tcp_checksum
-
+    close_port(conn.source_address[1])
