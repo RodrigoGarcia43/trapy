@@ -9,8 +9,8 @@ _server = accept(server)
 while True:
     r = recv(_server, 47)
     print("data recived: " + str(r))
-    r = r.upper()
-    print(send(_server, r))
+# r = r.upper()
+# print(send(_server, r))
 
 close(server)
 close(_server)

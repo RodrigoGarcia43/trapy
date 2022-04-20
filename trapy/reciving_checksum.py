@@ -1,4 +1,3 @@
-import socket
 from trapy import Conn
 from utils import _get_packet, verify_checksum
 

@@ -1,5 +1,4 @@
 from utils import build_tcp_header
-import socket
 from trapy import Conn
 
 conn = Conn()

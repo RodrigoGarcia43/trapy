@@ -11,8 +11,8 @@ client = dial(server_host + f":{server_port}")
 timer = time.time()
 val = "tres tristes tigres tragaban trigo en un trigal" * 5000
 print(send(client, bytes(val, "utf8")))
-while True:
-    r = recv(client, 47)
-    print("data recived: ", r)
-print(time.time() - timer)
+# while True:
+# r = recv(client, 1000000000000000000000000000000000000000000)
+# print("data recived: ", r)
+# print(time.time() - timer)
 close(client)

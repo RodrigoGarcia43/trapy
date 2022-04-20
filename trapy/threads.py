@@ -10,7 +10,7 @@ class RecvTask:
         self.is_runing = False
 
     def _recv(self, conn):
-        conn.socket.settimeout(0.1)
+        conn.socket.settimeout(0.01)
         while self.is_runing:
             try:
                 data, _ = conn.socket.recvfrom(65565)

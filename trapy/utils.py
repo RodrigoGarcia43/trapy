@@ -19,14 +19,14 @@ def build_tcp_header(
     tcp_dest = dest_port
     tcp_seq = seq
     tcp_ack_seq = ack
-    tcp_doff = 5  # 4 bit field, size of tcp header, 5 * 4 = 20 bytes
+    tcp_doff = 5
     tcp_fin = fin
     tcp_syn = syn
     tcp_rst = rst
     tcp_psh = 0
     tcp_ack = _ack
     tcp_urg = 0
-    tcp_window = socket.htons(5840)  # maximum allowed window size
+    tcp_window = socket.htons(5840)
     tcp_check = 0
     tcp_urg_ptr = 0
 
@@ -40,7 +40,6 @@ def build_tcp_header(
         + (tcp_urg << 5)
     )
 
-    # the ! in the pack format string means network order
     tcp_header = pack(
         "!HHLLBBHHH",
         tcp_source,
@@ -54,13 +53,10 @@ def build_tcp_header(
         tcp_urg_ptr,
     )
 
-    # pseudo header fields
-
     placeholder = 0
     protocol = socket.IPPROTO_TCP
 
     tcp_length = 20 + len(data)
-    # tcp_length = 20
 
     pseudo_header = pack("!BBH", placeholder, protocol, tcp_length)
 
@@ -69,8 +65,6 @@ def build_tcp_header(
 
     tcp_check = get_checksum(total_header)
 
-    # make the tcp header again and fill the correct checksum - remember
-    # checksum is NOT in network byte order
     tcp_header = pack(
         "!HHLLBBHHH",
         tcp_source,
@@ -87,14 +81,6 @@ def build_tcp_header(
 
 
 def get_checksum(data):
-    # sum = 0
-    # for index in range(0, len(data), 2):
-    #     word = (data[index] << 8) + (data[index + 1])
-    #     sum = sum + word
-    # sum = (sum >> 16) + (sum & 0xFFFF)
-    # sum = ~sum & 0xFFFF
-    # return sum
-
     sum = 0
     for i in range(0, len(data), 2):
         if i < len(data) and (i + 1) < len(data):
@@ -103,7 +89,6 @@ def get_checksum(data):
             sum += data[i]
     addon_carry = (sum & 0xFFFF) + (sum >> 16)
     result = (~addon_carry) & 0xFFFF
-    # swap bytes
     result = result >> 8 | ((result & 0x00FF) << 8)
     return result
 
@@ -121,7 +106,7 @@ def get_packet(data, conn):
         tcp_header[1] == conn.source_address[1]
         and tcp_header[0] == conn.dest_address[1]
         and socket.inet_ntoa(ip_header[8]) == conn.dest_address[0]
-        # and verify_checksum(ip_header, tcp_header, data)
+        and verify_checksum(ip_header, tcp_header, data)
     ):
         return ip_header, tcp_header, data
     else:
